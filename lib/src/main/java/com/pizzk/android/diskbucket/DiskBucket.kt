@@ -66,7 +66,7 @@ class DiskBucket private constructor(private val bucket: String) {
         }
     }
 
-    fun keyValues(context: Context): List<String> {
+    fun ls(context: Context): List<String> {
         val dir: File = dir(context) ?: return emptyList()
         return doWithLock<List<String>>(things = {
             val map: File = Maps.get(dir)
@@ -79,13 +79,21 @@ class DiskBucket private constructor(private val bucket: String) {
         val dir: File = dir(context) ?: return null
         return doWithLock<File>(things = {
             val maps: File = Maps.get(dir)
-            val line: String = Files.readLines(maps).find { it.startsWith(key) } ?: return null
-            val keyValues: List<String> = line.split(SPLIT_FLAG)
-            if (keyValues.size != 2) return null
-            val value: String = keyValues[1]
-            val file = File(dir, value)
-            return if (file.exists() && file.isFile) file else null
-        }, readonly = true)
+            val lines: List<String> = Files.readLines(maps)
+            val line: String = lines.find { it.startsWith(key) } ?: return null
+            val entity: Entity = Entity.parse(line) ?: return null
+            val file = File(dir, entity.name)
+            if (!file.exists() || !file.isFile) return null
+            //更新引用计数
+            Maps.backup(dir)
+            val newLine: String = entity.string(increase = true)
+            val newLines: MutableList<String> = LinkedList()
+            newLines.addAll(lines)
+            val index: Int = lines.indexOf(line)
+            newLines[index] = newLine
+            Maps.update(dir, newLines)
+            return file
+        }, finally = { Maps.recover(dir) }, readonly = false)
     }
 
     fun put(context: Context, key: String, name: String, ins: InputStream): File? {
@@ -94,12 +102,15 @@ class DiskBucket private constructor(private val bucket: String) {
         return doWithLock<File>(things = {
             val map: File = Maps.backup(dir) ?: return null
             if (name == map.name) throw Exception("bucket map file name conflict.")
+            if (key.contains(SPLIT_FLAG)) throw Exception("object key contains '${SPLIT_FLAG}'.")
+            if (name.contains(SPLIT_FLAG)) throw Exception("object name contains '${SPLIT_FLAG}'.")
             val sFile = File(dir, name)
             //文件存储
             Files.save(sFile, ins)
             if (!sFile.exists() || !sFile.isFile) return null
-            val line = "$key${SPLIT_FLAG}$name"
-            //更新map文件
+            val stamp: Long = System.currentTimeMillis()
+            val line: String = Entity(key, name, 0, stamp).string(increase = false)
+            //更新映射文件
             val lines: List<String> = Files.readLines(map)
             val retains: List<String> = lines.filterNot { it.startsWith(key) }
             val newLines: MutableList<String> = LinkedList()
@@ -113,40 +124,107 @@ class DiskBucket private constructor(private val bucket: String) {
         }, finally = { Maps.recover(dir) }, readonly = false)
     }
 
+    private fun deleteByKey(dir: File, keys: List<String>): Boolean {
+        if (keys.isEmpty()) return false
+        val map: File = Maps.backup(dir) ?: return false
+        val lines: List<String> = Files.readLines(map)
+        val hits: List<String> = keys.map { key: String ->
+            val line: String = lines.find { it.startsWith(key) } ?: return@map null
+            val entity: Entity = Entity.parse(line) ?: return@map null
+            val file = File(dir, entity.name)
+            if (file.exists() && file.isFile) file.delete()
+            return@map line
+        }.filterNotNull()
+        if (hits.isEmpty()) return false
+        val newLines: List<String> = lines.filterNot { hits.contains(it) }
+        return Maps.update(dir, newLines)
+    }
+
     fun del(context: Context, keys: List<String>): Boolean {
         if (keys.isEmpty()) return false
         val dir: File = dir(context) ?: return false
         return doWithLock<Boolean>(things = {
-            val map: File = Maps.backup(dir) ?: return false
-            val lines: List<String> = Files.readLines(map)
-            val hits: List<String> = keys.map { key: String ->
-                val line: String = lines.find { it.startsWith(key) } ?: return@map null
-                val keyValues: List<String> = line.split(SPLIT_FLAG)
-                if (keyValues.size == 2) {
-                    val value: String = keyValues[1]
-                    val file = File(dir, value)
-                    if (file.exists() && file.isFile) file.delete()
-                }
-                return@map line
-            }.filterNotNull()
-            val newLines: List<String> = lines.filterNot { hits.contains(it) }
-            if (newLines.size == lines.size) return false
-            return Maps.update(dir, newLines)
+            return deleteByKey(dir, keys)
         }, finally = { Maps.recover(dir) }, readonly = false) ?: false
     }
 
-    fun remove(context: Context) {
+    fun clean(context: Context) {
+        val dir: File = dir(context) ?: return
+        doWithLock(things = { Files.deletes(dir) }, readonly = false)
+    }
+
+    fun gc(context: Context, bytes: Long, capacity: Int) {
         val dir: File = dir(context) ?: return
         doWithLock(things = {
-            Files.deletes(dir)
-        }, readonly = false)
+            val map: File = Maps.get(dir)
+            val lines: List<String> = Files.readLines(map)
+            //第一步：删除不在bucket.map中的文件
+            val fs: List<File> = dir.listFiles().filterNot {
+                val e: String? = lines.find { line: String -> line.contains(it.name) }
+                return@filterNot !e.isNullOrEmpty()
+            }.filterNot { it.name == Maps.MAP_FILE }
+            fs.forEach(Files::deletes)
+            //第二步:通过计算使用率排名，将超出文件大小及项目数的文件删除
+            val now: Long = System.currentTimeMillis()
+            val origins: List<Entity> = lines.mapNotNull { line: String -> Entity.parse(line) }
+            //使用率降序排序
+            val es: List<Entity> = origins.sortedByDescending { e: Entity ->
+                val duration: Double = (now - e.stamp) / 1.0
+                return@sortedByDescending e.count / duration
+            }
+            val delKeys: MutableList<String> = LinkedList()
+            //对排名落后，超出Bucket文件尺寸限制或 bucket.map 中有记录但文件不存在的进行清理
+            var totalSize: Long = 0
+            val cLines: List<Entity> = es.filter { e: Entity ->
+                val file = File(dir, e.name)
+                if (!file.exists() || !file.isFile || totalSize > bytes) {
+                    delKeys.add(e.key)
+                    return@filter false
+                }
+                totalSize += file.length()
+                return@filter true
+            }
+            //超出文件项目数的进行清理
+            if (cLines.size > capacity) {
+                delKeys.addAll(cLines.subList(capacity, cLines.size).map(Entity::key))
+            }
+            //删除文件
+            deleteByKey(dir, delKeys)
+        }, finally = { Maps.recover(dir) }, readonly = false)
+    }
+
+    /**
+     * 记录实体
+     */
+    class Entity constructor(
+        val key: String,
+        val name: String,
+        val count: Int,
+        val stamp: Long
+    ) {
+        companion object {
+            fun parse(line: String): Entity? {
+                val parts: List<String> = line.split(SPLIT_FLAG)
+                if (parts.size != 4) return null
+                val key: String = parts[0]
+                val name: String = parts[1]
+                val count: Int = parts[2].toIntOrNull() ?: 0
+                val stamp: Long = parts[3].toLongOrNull() ?: 0
+                return Entity(key, name, count, stamp)
+            }
+        }
+
+        fun string(increase: Boolean = false): String {
+            val count: Int = if (increase) count + 1 else count
+            return arrayOf(key, name, count, stamp).joinToString(separator = SPLIT_FLAG)
+        }
     }
 
     /**
      * 映射相关接口
      */
     object Maps {
-        private const val MAP_FILE = "bucket.map"
+        const val MAP_FILE = "bucket.map"
         private const val MAP_BAK_EXT = ".bak"
 
         fun get(dir: File): File {

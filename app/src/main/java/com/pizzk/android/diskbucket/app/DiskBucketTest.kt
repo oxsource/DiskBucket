@@ -12,9 +12,12 @@ object DiskBucketTest {
     private val key: String = "file1"
 
     fun doWrite(context: Context) {
-        val line = "hello, this is a text."
-        val ins = ByteArrayInputStream(line.toByteArray())
-        bucket.put(context, key, "$key.txt", ins)
+        for (i: Int in 0..10) {
+            val line = "hello, this is a text $i."
+            val ins = ByteArrayInputStream(line.toByteArray())
+            val symbol = "$key$i"
+            bucket.put(context, symbol, "$symbol.txt", ins)
+        }
     }
 
     fun doRead(context: Context) {
@@ -23,7 +26,7 @@ object DiskBucketTest {
     }
 
     fun doPrint(context: Context) {
-        val vs = bucket.keyValues(context)
+        val vs = bucket.ls(context)
         Log.d(TAG, "${vs.size}")
     }
 
@@ -31,7 +34,11 @@ object DiskBucketTest {
         bucket.del(context, listOf(key))
     }
 
-    fun doRemove(context: Context) {
-        bucket.remove(context)
+    fun doClean(context: Context) {
+        bucket.clean(context)
+    }
+
+    fun doGC(context: Context) {
+        bucket.gc(context, 5 * 1024 * 1024, 5)
     }
 }
