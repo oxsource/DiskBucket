@@ -13,6 +13,9 @@ class DiskBucket private constructor(private val bucket: String) {
     companion object {
         private const val NAMESPACE = "DiskBucket"
         private const val SPLIT_FLAG = ","
+        private const val MAX_KEY_LEN = 48
+        private const val MAX_META_LEN = 64
+        private const val EXT = ".dsb"
         private val map: MutableMap<String, DiskBucket> = Collections.synchronizedMap(HashMap())
 
         fun get(bucket: String): DiskBucket {
@@ -45,6 +48,8 @@ class DiskBucket private constructor(private val bucket: String) {
             null
         }
     }
+
+    private fun withExt(key: String) = "$key.$EXT"
 
     private inline fun <reified T> doWithLock(
         things: () -> T?,
@@ -82,7 +87,7 @@ class DiskBucket private constructor(private val bucket: String) {
             val lines: List<String> = Files.readLines(maps)
             val line: String = lines.find { it.startsWith(key) } ?: return null
             val entity: Entity = Entity.parse(line) ?: return null
-            val file = File(dir, entity.name)
+            val file = File(dir, withExt(entity.key))
             if (!file.exists() || !file.isFile) return null
             //更新引用计数
             Maps.backup(dir)
@@ -96,20 +101,20 @@ class DiskBucket private constructor(private val bucket: String) {
         }, finally = { Maps.recover(dir) }, readonly = false)
     }
 
-    fun put(context: Context, key: String, name: String, ins: InputStream): File? {
-        if (key.isEmpty() || name.isEmpty()) return null
+    fun put(context: Context, key: String, ins: InputStream, meta: String = ""): File? {
+        if (key.trim().isEmpty()) return null
+        if (key.length > MAX_KEY_LEN) throw Exception("key is too long.")
+        if (key.contains(SPLIT_FLAG)) throw Exception("key can't contains '${SPLIT_FLAG}'.")
+        if (meta.length > MAX_META_LEN) throw Exception("meta is too long.")
         val dir: File = dir(context) ?: return null
         return doWithLock<File>(things = {
             val map: File = Maps.backup(dir) ?: return null
-            if (name == map.name) throw Exception("bucket map file name conflict.")
-            if (key.contains(SPLIT_FLAG)) throw Exception("object key contains '${SPLIT_FLAG}'.")
-            if (name.contains(SPLIT_FLAG)) throw Exception("object name contains '${SPLIT_FLAG}'.")
-            val sFile = File(dir, name)
             //文件存储
+            val sFile = File(dir, withExt(key))
             Files.save(sFile, ins)
             if (!sFile.exists() || !sFile.isFile) return null
             val stamp: Long = System.currentTimeMillis()
-            val line: String = Entity(key, name, 0, stamp).string(increase = false)
+            val line: String = Entity(key, meta, 0, stamp).string(increase = false)
             //更新映射文件
             val lines: List<String> = Files.readLines(map)
             val retains: List<String> = lines.filterNot { it.startsWith(key) }
@@ -131,7 +136,7 @@ class DiskBucket private constructor(private val bucket: String) {
         val hits: List<String> = keys.map { key: String ->
             val line: String = lines.find { it.startsWith(key) } ?: return@map null
             val entity: Entity = Entity.parse(line) ?: return@map null
-            val file = File(dir, entity.name)
+            val file = File(dir, withExt(entity.key))
             if (file.exists() && file.isFile) file.delete()
             return@map line
         }.filterNotNull()
@@ -176,7 +181,7 @@ class DiskBucket private constructor(private val bucket: String) {
             //对排名落后，超出Bucket文件尺寸限制或 bucket.map 中有记录但文件不存在的进行清理
             var totalSize: Long = 0
             val cLines: List<Entity> = es.filter { e: Entity ->
-                val file = File(dir, e.name)
+                val file = File(dir, withExt(e.key))
                 if (!file.exists() || !file.isFile || totalSize > bytes) {
                     delKeys.add(e.key)
                     return@filter false
@@ -198,7 +203,7 @@ class DiskBucket private constructor(private val bucket: String) {
      */
     class Entity constructor(
         val key: String,
-        val name: String,
+        val meta: String,
         val count: Int,
         val stamp: Long
     ) {
@@ -216,7 +221,7 @@ class DiskBucket private constructor(private val bucket: String) {
 
         fun string(increase: Boolean = false): String {
             val count: Int = if (increase) count + 1 else count
-            return arrayOf(key, name, count, stamp).joinToString(separator = SPLIT_FLAG)
+            return arrayOf(key, meta, count, stamp).joinToString(separator = SPLIT_FLAG)
         }
     }
 
@@ -348,6 +353,12 @@ class DiskBucket private constructor(private val bucket: String) {
             } catch (e: Exception) {
                 e.printStackTrace()
             }
+        }
+
+        fun ext(name: String): String {
+            val index: Int = name.lastIndexOf(".")
+            if (index < 0 || name.length == index + 1) return ""
+            return name.substring(index + 1, name.length)
         }
     }
 }
