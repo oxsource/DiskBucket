@@ -15,7 +15,7 @@ class DiskBucket private constructor(private val bucket: String) {
         private const val SPLIT_FLAG = ","
         private const val MAX_KEY_LEN = 48
         private const val MAX_META_LEN = 64
-        private const val EXT = ".dsb"
+        private const val EXT = ".ds"
         private val map: MutableMap<String, DiskBucket> = Collections.synchronizedMap(HashMap())
 
         fun get(bucket: String): DiskBucket {
