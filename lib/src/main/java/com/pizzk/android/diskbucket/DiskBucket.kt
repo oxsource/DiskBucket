@@ -49,6 +49,14 @@ class DiskBucket private constructor(private val bucket: String) {
         }
     }
 
+    private fun catcher(block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private fun withExt(key: String) = "$key.$EXT"
 
     private inline fun <reified T> doWithLock(
@@ -66,8 +74,8 @@ class DiskBucket private constructor(private val bucket: String) {
             e.printStackTrace()
             null
         } finally {
-            Files.catcher { finally() }
-            Files.catcher { lock.unlock() }
+            catcher { finally() }
+            catcher { lock.unlock() }
         }
     }
 
@@ -75,7 +83,7 @@ class DiskBucket private constructor(private val bucket: String) {
         val dir: File = dir(context) ?: return emptyList()
         return doWithLock<List<String>>(things = {
             val map: File = Maps.get(dir)
-            return Files.readLines(map)
+            return map.readLines()
         }, readonly = true) ?: emptyList()
     }
 
@@ -84,7 +92,7 @@ class DiskBucket private constructor(private val bucket: String) {
         val dir: File = dir(context) ?: return null
         return doWithLock<File>(things = {
             val maps: File = Maps.get(dir)
-            val lines: List<String> = Files.readLines(maps)
+            val lines: List<String> = maps.readLines()
             val line: String = lines.find { it.startsWith(key) } ?: return null
             val entity: Entity = Entity.parse(line) ?: return null
             val file = File(dir, withExt(entity.key))
@@ -111,12 +119,12 @@ class DiskBucket private constructor(private val bucket: String) {
             val map: File = Maps.backup(dir) ?: return null
             //文件存储
             val sFile = File(dir, withExt(key))
-            Files.save(sFile, ins)
+            sFile.outputStream().use { ins.copyTo(it) }
             if (!sFile.exists() || !sFile.isFile) return null
             val stamp: Long = System.currentTimeMillis()
             val line: String = Entity(key, meta, 0, stamp).string(increase = false)
             //更新映射文件
-            val lines: List<String> = Files.readLines(map)
+            val lines: List<String> = map.readLines()
             val retains: List<String> = lines.filterNot { it.startsWith(key) }
             val newLines: MutableList<String> = LinkedList()
             newLines.addAll(retains)
@@ -132,7 +140,7 @@ class DiskBucket private constructor(private val bucket: String) {
     private fun deleteByKey(dir: File, keys: List<String>): Boolean {
         if (keys.isEmpty()) return false
         val map: File = Maps.backup(dir) ?: return false
-        val lines: List<String> = Files.readLines(map)
+        val lines: List<String> = map.readLines()
         val hits: List<String> = keys.map { key: String ->
             val line: String = lines.find { it.startsWith(key) } ?: return@map null
             val entity: Entity = Entity.parse(line) ?: return@map null
@@ -155,20 +163,20 @@ class DiskBucket private constructor(private val bucket: String) {
 
     fun clean(context: Context) {
         val dir: File = dir(context) ?: return
-        doWithLock(things = { Files.deletes(dir) }, readonly = false)
+        doWithLock(things = { dir.deleteRecursively() }, readonly = false)
     }
 
     fun gc(context: Context, bytes: Long, capacity: Int) {
         val dir: File = dir(context) ?: return
         doWithLock(things = {
             val map: File = Maps.get(dir)
-            val lines: List<String> = Files.readLines(map)
+            val lines: List<String> = map.readLines()
             //第一步：删除不在bucket.map中的文件
             val fs: List<File> = dir.listFiles().filterNot {
                 val e: String? = lines.find { line: String -> line.contains(it.name) }
                 return@filterNot !e.isNullOrEmpty()
             }.filterNot { it.name == Maps.MAP_FILE }
-            fs.forEach(Files::deletes)
+            fs.forEach(File::deleteRecursively)
             //第二步:通过计算使用率排名，将超出文件大小及项目数的文件删除
             val now: Long = System.currentTimeMillis()
             val origins: List<Entity> = lines.mapNotNull { line: String -> Entity.parse(line) }
@@ -228,7 +236,7 @@ class DiskBucket private constructor(private val bucket: String) {
     /**
      * 映射相关接口
      */
-    object Maps {
+    private object Maps {
         const val MAP_FILE = "bucket.map"
         private const val MAP_BAK_EXT = ".bak"
 
@@ -261,104 +269,13 @@ class DiskBucket private constructor(private val bucket: String) {
         fun update(dir: File, lines: List<String>): Boolean {
             val file: File = get(dir)
             val bak = File("${file.absolutePath}${MAP_BAK_EXT}")
-            Files.writeLines(file, lines)
+            file.printWriter().use { lines.forEach(it::println) }
             if (!file.exists() || !file.isFile || file.length() <= 0) {
                 if (bak.renameTo(file)) bak.delete()
                 return false
             }
             bak.delete()
             return true
-        }
-    }
-
-    /**
-     * 文件相关接口
-     */
-    object Files {
-        private const val BUFFER_SIZE = 8 * 1024
-
-        private fun closeSafely(closeable: Closeable?) {
-            closeable ?: return
-            try {
-                closeable.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        fun save(file: File, ins: InputStream, bSize: Int = BUFFER_SIZE) {
-            var outs: OutputStream? = null
-            try {
-                if (file.exists()) file.delete()
-                outs = FileOutputStream(file)
-                val buffer = ByteArray(bSize)
-                var length: Int = -1
-                while ({ length = ins.read(buffer);length }() > 0) {
-                    outs.write(buffer, 0, length)
-                }
-                outs.flush()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
-                closeSafely(ins)
-                closeSafely(outs)
-            }
-        }
-
-        fun writeLines(file: File, lines: List<String>) {
-            var writer: PrintWriter? = null
-            try {
-                writer = PrintWriter(BufferedWriter(FileWriter(file)))
-                lines.forEach { line: String ->
-                    writer.println(line)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
-                closeSafely(writer)
-            }
-        }
-
-        fun readLines(file: File): List<String> {
-            var reader: BufferedReader? = null
-            return try {
-                reader = BufferedReader(FileReader(file))
-                reader.readLines()
-            } catch (e: Exception) {
-                e.printStackTrace()
-                emptyList()
-            } finally {
-                closeSafely(reader)
-            }
-        }
-
-        fun deletes(file: File) {
-            if (file.isFile) {
-                file.delete()
-                return
-            }
-            val fs: Array<File> = file.listFiles()
-            if (fs.isEmpty()) {
-                file.delete()
-                return
-            }
-            for (f: File in fs) {
-                deletes(f)
-            }
-        }
-
-        fun catcher(block: () -> Unit) {
-            try {
-                block()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
-        fun ext(name: String): String {
-            val index: Int = name.lastIndexOf(".")
-            if (index < 0 || name.length == index + 1) return ""
-            return name.substring(index + 1, name.length)
         }
     }
 }
